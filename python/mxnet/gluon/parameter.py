@@ -108,6 +108,12 @@ class Parameter(object):
         self._var = None
         self._data = None
         self._grad = None
+        # ==================================================
+        # gpu and cpu memory for storing compressed gradient
+        self._comp_gpu = None
+        self._comp_cpu = None
+        self._residual = None
+        # ==================================================
         self._ctx_list = None
         self._ctx_map = None
         self._trainer = None
@@ -381,6 +387,16 @@ class Parameter(object):
             self._grad = [ndarray.zeros(shape=i.shape, dtype=i.dtype, ctx=i.ctx,
                                         stype=self._grad_stype) for i in self._data]
 
+        # pinned cpu memory for compressed gradient
+        self._comp_cpu = [ndarray.zeros(shape=(i.size*2*4), dtype='uint8', ctx=context.cpu_pinned(),
+                                        stype=self._grad_stype) for i in self._data]
+
+        self._comp_gpu = [ndarray.zeros(shape=(i.size*5), dtype='uint8', ctx=i.context,
+                                        stype=self._grad_stype) for i in self._data]
+
+        self._residual = [ndarray.zeros(shape=i.size, dtype=i.dtype, ctx=i.context,
+                                        stype=self._grad_stype) for i in self._data]
+
         autograd.mark_variables(self._check_and_get(self._data, list),
                                 self._grad, self.grad_req)
 
@@ -610,6 +626,33 @@ class Parameter(object):
                 "Cannot get gradient array for Parameter '%s' " \
                 "because grad_req='null'"%(self.name))
         return self._check_and_get(self._grad, list)
+
+    def list_comp_cpu(self):
+        """Returns cpu gradient buffers, in the same order
+        as :py:meth:`values`."""
+        if self._data is not None and self._comp_cpu is None:
+            raise RuntimeError(
+                "Cannot get gradient array for Parameter '%s' " \
+                "because grad_req='null'"%(self.name))
+        return self._check_and_get(self._comp_cpu, list)
+
+    def list_comp_gpu(self):
+        """Returns compressed gradient buffer, in the same order
+        as :py:meth:`values`."""
+        if self._data is not None and self._comp_gpu is None:
+            raise RuntimeError(
+                "Cannot get gradient array for Parameter '%s' " \
+                "because grad_req='null'"%(self.name))
+        return self._check_and_get(self._comp_gpu, list)
+
+    def list_residual(self):
+        """Returns residual buffer, in the same order
+        as :py:meth:`values`."""
+        if self._data is not None and self._residual is None:
+            raise RuntimeError(
+                "Cannot get gradient array for Parameter '%s' " \
+                "because grad_req='null'"%(self.name))
+        return self._check_and_get(self._residual, list)
 
     def list_ctx(self):
         """Returns a list of contexts this parameter is initialized on."""

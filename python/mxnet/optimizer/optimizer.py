@@ -2075,17 +2075,32 @@ class Updater(object):
         self.states_synced = {}
         self.aggregate_updates = optimizer.aggregate_num > 0
 
-    def __call__(self, index, grad, weight):
+    def __call__(self, index, grad, weight, name,
+                 allreduce=False, comp_cpu=None, comp_gpu=None, residual=None, batchid=0):
         """Updates weight given gradient and index."""
         allow_np = self.optimizer.allow_np_array if hasattr(self.optimizer, "allow_np_array") else is_np_array()
         if not isinstance(index, (list, tuple)):
             indices = [index]
             grads = [_as_classic(grad, allow_np)]
             weights = [_as_classic(weight, allow_np)]
+            names = [name]
+            if comp_cpu is not None:
+                comp_cpus = [comp_cpu]
+            if comp_gpu is not None:
+                comp_gpus = [comp_gpu]
+            if residual is not None:
+                residuals = [residual]
         else:
             indices = index
             grads = _as_classic(grad, allow_np)
             weights = _as_classic(weight, allow_np)
+            names = name
+            if comp_cpu is not None:
+                comp_cpus = comp_cpu
+            if comp_gpu is not None:
+                comp_gpus = comp_gpu
+            if residual is not None:
+                residuals = residual
         if weights:
             self.optimizer._set_current_context(weights[0].context.device_id)
         for i, idx in enumerate(indices):
@@ -2103,28 +2118,48 @@ class Updater(object):
         if self.aggregate_updates:
             # segregate values based on type
             type_map = {}
-            for i, w, g in zip(indices, weights, grads):
+            for i, w, g, cp_c, cp_g, res in zip(indices, weights, grads, comp_cpus, comp_gpus, residuals):
                 if w.dtype in type_map:
-                    type_map[w.dtype].append((i, w, g))
+                    type_map[w.dtype].append((i, w, g, cp_c, cp_g, res))
                 else:
-                    type_map[w.dtype] = [(i, w, g)]
+                    type_map[w.dtype] = [(i, w, g, cp_c, cp_g, res)]
             for idx in type_map:
                 current_index = 0
-                indices, weights, grads = zip(*type_map[idx])
+                indices, weights, grads, comp_cpus, comp_gpus, residuals = zip(*type_map[idx])
                 while current_index < len(indices):
                     states = []
                     step = min(self.optimizer.aggregate_num, len(indices) - current_index)
                     for j in range(step):
                         states.append(self.states[indices[current_index + j]])
-                    self.optimizer.update_multi_precision(
-                        indices[current_index:current_index + self.optimizer.aggregate_num],
-                        weights[current_index:current_index + self.optimizer.aggregate_num],
-                        grads[current_index:current_index + self.optimizer.aggregate_num],
-                        states)
+                    if allreduce:
+                        self.optimizer.do_allreduce(
+                            indices[current_index:current_index + self.optimizer.aggregate_num],
+                            weights[current_index:current_index + self.optimizer.aggregate_num],
+                            grads[current_index:current_index + self.optimizer.aggregate_num],
+                            states,
+                            names[current_index:current_index + self.optimizer.aggregate_num],
+                            comp_cpu=comp_cpus[current_index:current_index + self.optimizer.aggregate_num],
+                            comp_gpu=comp_gpus[current_index:current_index + self.optimizer.aggregate_num],
+                            residual=residuals[current_index:current_index + self.optimizer.aggregate_num],
+                            batchid=batchid)
+                    else:
+                        self.optimizer.update_multi_precision(
+                            indices[current_index:current_index + self.optimizer.aggregate_num],
+                            weights[current_index:current_index + self.optimizer.aggregate_num],
+                            grads[current_index:current_index + self.optimizer.aggregate_num],
+                            states,
+                            names[current_index:current_index + self.optimizer.aggregate_num],
+                            comp_cpu=comp_cpus[current_index:current_index + self.optimizer.aggregate_num],
+                            comp_gpu=comp_gpus[current_index:current_index + self.optimizer.aggregate_num],
+                            residual=residuals[current_index:current_index + self.optimizer.aggregate_num],
+                            batchid=batchid)
                     current_index += self.optimizer.aggregate_num
         else:
-            for i, w, g in zip(indices, weights, grads):
-                self.optimizer.update_multi_precision(i, w, g, self.states[i])
+            for i, w, g, n, cp_c, cp_g, res in zip(indices, weights, grads, names, comp_cpus, comp_gpus, residuals):
+                if allreduce:
+                    self.optimizer.do_allreduce(i, w, g, self.states[i], n, comp_cpu=cp_c, comp_gpu=cp_g, residual=res, batchid=batchid)
+                else:
+                    self.optimizer.update_multi_precision(i, w, g, self.states[i], n, comp_cpu=cp_c, comp_gpu=cp_g, residual=res, batchid=batchid)
 
     def sync_state_context(self, state, context):
         """sync state context."""
@@ -2158,6 +2193,7 @@ class Updater(object):
             information such as learning rate and weight decay schedules.
         """
         return pickle.dumps((self.states, self.optimizer) if dump_optimizer else self.states)
+
 
 def get_updater(optimizer):
     """Returns a closure of the updater needed for kvstore.

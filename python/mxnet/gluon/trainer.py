@@ -317,7 +317,7 @@ class Trainer(object):
                                   'is used.')
         self._optimizer.rescale_grad = scale
 
-    def step(self, batch_size, ignore_stale_grad=False):
+    def step(self, batch_size, ignore_stale_grad=False, batchid=0):
         """Makes one step of parameter update. Should be called after
         `autograd.backward()` and outside of `record()` scope.
 
@@ -344,7 +344,7 @@ class Trainer(object):
             self._init_params()
 
         self._allreduce_grads()
-        self._update(ignore_stale_grad)
+        self._update(ignore_stale_grad, batchid=batchid)
 
     def allreduce_grads(self):
         """For each parameter, reduce the gradients from different contexts.
@@ -394,7 +394,7 @@ class Trainer(object):
                     else:
                         self._kvstore.pushpull(i, grad_list, priority=-i)
 
-    def update(self, batch_size, ignore_stale_grad=False):
+    def update(self, batch_size, ignore_stale_grad=False, allreduce=False, batchid=0):
         """Makes one step of parameter update.
 
         Should be called after `autograd.backward()` and outside of `record()` scope,
@@ -425,9 +425,9 @@ class Trainer(object):
                 'to False when creating trainer.'
 
         self._check_and_rescale_grad(self._scale / batch_size)
-        self._update(ignore_stale_grad)
+        self._update(ignore_stale_grad, allreduce=allreduce, batchid=batchid)
 
-    def _update(self, ignore_stale_grad=False):
+    def _update(self, ignore_stale_grad=False, allreduce=False, batchid=0):
         loss_scaler = getattr(self, '_amp_loss_scaler', None)
         if loss_scaler is not None:
             if loss_scaler.has_overflow(self._params):
@@ -439,31 +439,36 @@ class Trainer(object):
             if param.grad_req == 'null':
                 continue
 
-            if not ignore_stale_grad:
-                for data in param._check_and_get(param._data, list):
-                    if not data._fresh_grad:
-                        raise UserWarning(
-                            "Gradient of Parameter `%s` on context %s has not been updated "
-                            "by backward since last `step`. This could mean a bug in your "
-                            "model that made it only use a subset of the Parameters (Blocks) "
-                            "for this iteration. If you are intentionally only using a subset, "
-                            "call step with ignore_stale_grad=True to suppress this "
-                            "warning and skip updating of Parameters with stale gradient" \
-                            %(param.name, str(data.context)))
+            if not allreduce:
+                if not ignore_stale_grad:
+                    for data in param._check_and_get(param._data, list):
+                        if not data._fresh_grad:
+                            raise UserWarning(
+                                "Gradient of Parameter `%s` on context %s has not been updated "
+                                "by backward since last `step`. This could mean a bug in your "
+                                "model that made it only use a subset of the Parameters (Blocks) "
+                                "for this iteration. If you are intentionally only using a subset, "
+                                "call step with ignore_stale_grad=True to suppress this "
+                                "warning and skip updating of Parameters with stale gradient" \
+                                %(param.name, str(data.context)))
 
             if self._kvstore and self._update_on_kvstore:
                 continue
 
-            for upd, arr, grad in zip(updates, param.list_data(), param.list_grad()):
+            for upd, arr, grad, comp_cpu, comp_gpu, residual \
+                in zip(updates, param.list_data(), param.list_grad(), \
+                       param.list_comp_cpu(), param.list_comp_gpu(), param.list_residual()):
                 if not ignore_stale_grad or arr._fresh_grad:
-                    upd.append((i, grad, arr))
-                    arr._fresh_grad = False
+                    elem = (i, grad, arr, param.name, comp_cpu, comp_gpu, residual)
+                    if not allreduce:
+                        arr._fresh_grad = False
+                    upd.append(elem)
 
         if not (self._kvstore and self._update_on_kvstore):
             for updater, upd in zip(self._updaters, updates):
                 if upd:
-                    i, w, g = zip(*upd)
-                    updater(i, w, g)
+                    i, g, w, n, cp_cpu, cp_gpu, res = zip(*upd)
+                    updater(i, g, w, n, allreduce=allreduce, comp_cpu=cp_cpu, comp_gpu=cp_gpu, residual=res, batchid=batchid)
 
     def save_states(self, fname):
         """Saves trainer states (e.g. optimizer, momentum) to a file.
