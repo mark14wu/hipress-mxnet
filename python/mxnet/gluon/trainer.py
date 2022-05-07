@@ -455,20 +455,17 @@ class Trainer(object):
             if self._kvstore and self._update_on_kvstore:
                 continue
 
-            for upd, arr, grad, comp_cpu, comp_gpu, residual \
-                in zip(updates, param.list_data(), param.list_grad(), \
-                       param.list_comp_cpu(), param.list_comp_gpu(), param.list_residual()):
+            for upd, arr, grad in zip(updates, param.list_data(), param.list_grad()):
                 if not ignore_stale_grad or arr._fresh_grad:
-                    elem = (i, grad, arr, param.name, comp_cpu, comp_gpu, residual)
+                    upd.append((i, grad, arr))
                     if not allreduce:
-                        arr._fresh_grad = False
-                    upd.append(elem)
+                        arr._fresh_grad = False 
 
         if not (self._kvstore and self._update_on_kvstore):
             for updater, upd in zip(self._updaters, updates):
                 if upd:
-                    i, g, w, n, cp_cpu, cp_gpu, res = zip(*upd)
-                    updater(i, g, w, n, allreduce=allreduce, comp_cpu=cp_cpu, comp_gpu=cp_gpu, residual=res, batchid=batchid)
+                    i, w, g = zip(*upd)
+                    updater(i, w, g, allreduce=allreduce, batchid=batchid)
 
     def save_states(self, fname):
         """Saves trainer states (e.g. optimizer, momentum) to a file.
