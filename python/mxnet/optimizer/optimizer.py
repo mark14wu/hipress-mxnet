@@ -2075,8 +2075,7 @@ class Updater(object):
         self.states_synced = {}
         self.aggregate_updates = optimizer.aggregate_num > 0
 
-    def __call__(self, index, grad, weight,
-                 allreduce=False, batchid=0):
+    def __call__(self, index, grad, weight):
         """Updates weight given gradient and index."""
         allow_np = self.optimizer.allow_np_array if hasattr(self.optimizer, "allow_np_array") else is_np_array()
         if not isinstance(index, (list, tuple)):
@@ -2117,26 +2116,15 @@ class Updater(object):
                     step = min(self.optimizer.aggregate_num, len(indices) - current_index)
                     for j in range(step):
                         states.append(self.states[indices[current_index + j]])
-                    if allreduce:
-                        self.optimizer.do_allreduce(
-                            indices[current_index:current_index + self.optimizer.aggregate_num],
-                            weights[current_index:current_index + self.optimizer.aggregate_num],
-                            grads[current_index:current_index + self.optimizer.aggregate_num],
-                            states,
-                            batchid=batchid)
-                    else:
-                        self.optimizer.update_multi_precision(
-                            indices[current_index:current_index + self.optimizer.aggregate_num],
-                            weights[current_index:current_index + self.optimizer.aggregate_num],
-                            grads[current_index:current_index + self.optimizer.aggregate_num],
-                            states)
+                    self.optimizer.update_multi_precision(
+                        indices[current_index:current_index + self.optimizer.aggregate_num],
+                        weights[current_index:current_index + self.optimizer.aggregate_num],
+                        grads[current_index:current_index + self.optimizer.aggregate_num],
+                        states)
                     current_index += self.optimizer.aggregate_num
         else:
             for i, w, g in zip(indices, weights, grads):
-                if allreduce:
-                    self.optimizer.do_allreduce(i, w, g, self.states[i], batchid=batchid)
-                else:
-                    self.optimizer.update_multi_precision(i, w, g, self.states[i])
+                self.optimizer.update_multi_precision(i, w, g, self.states[i])
 
     def sync_state_context(self, state, context):
         """sync state context."""
@@ -2170,7 +2158,6 @@ class Updater(object):
             information such as learning rate and weight decay schedules.
         """
         return pickle.dumps((self.states, self.optimizer) if dump_optimizer else self.states)
-
 
 def get_updater(optimizer):
     """Returns a closure of the updater needed for kvstore.
