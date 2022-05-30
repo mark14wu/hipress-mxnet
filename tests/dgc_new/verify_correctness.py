@@ -15,6 +15,140 @@ def float32_to_int32(num):
 def N_to_M(N):
     return N*4
 
+def verify_mem_comp():
+    grad = [0, 0, 1]
+    u = [1, 1, 1]
+    v = [0, 3, 10]
+    ctx = mx.context.gpu(0)
+
+    grad = mx.nd.array(grad, ctx=ctx, dtype='float32')
+    u = mx.nd.array(u, ctx=ctx, dtype='float32')
+    v = mx.nd.array(v, ctx=ctx, dtype='float32')
+    momentum = 0.5
+
+    true_u = momentum * u + grad
+    true_v = true_u + v
+    mx.nd.contrib.dgc_mem_comp(
+        grad=grad,
+        u=u,
+        v=v,
+        # data=grad,
+        momentum=momentum
+    )
+    u.wait_to_read()
+    v.wait_to_read()
+    print(u)
+    print(true_u)
+    print(v)
+    print(true_v)
+    assert sum(u - true_u) == 0
+    assert sum(v - true_v) == 0
+    print("test passed!")
+
+def verify_topk():
+    u = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] * 100
+    verify_dgc(u, u)
+    # v = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0] + 10 * [0]
+    # verify_dgc(v, v)
+
+def verify_dgc_with_residual_clear():
+    g = [1, 1, 0, 0, 5, 5, 5, 0, 0, 0] + 10 * [0]
+    u = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0] + 10 * [0]
+    v = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0] + 10 * [0]
+    verify_dgc(g, u, v)
+
+    # u = [1, 1, 1, 0, 0, 0, 0, 0, 0, 0] + 10 * [0]
+    # v = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] + 10 * [0]
+    # verify_dgc(u, v)
+
+def get_size_in_header(A):
+    A = mx.nd.cast(A, dtype='int32')
+    return A[0] + 256 * A[1] + 65536 * A[2] + 256 * 65536 * A[3]
+
+def verify_dgc(grad, u, v):
+    ctx = mx.context.gpu(0)
+    dgc = mx.nd.contrib.dgc_new
+    dgcr = mx.nd.contrib.dgc_new_r
+    N = len(u)
+
+    to_compress = mx.nd.array(grad, ctx=ctx, dtype='float32')
+    input_u = mx.nd.array(u, ctx=ctx, dtype='float32')
+    input_v = mx.nd.array(v, ctx=ctx, dtype='float32')
+    compressed = mx.nd.zeros(shape=4 * N, ctx=ctx, dtype='uint8')
+    decompressed = mx.nd.zeros(shape=N, ctx=ctx, dtype='float32')
+
+    print("before dgc:")
+    print("grad", to_compress)
+    print("u", input_u)
+    print("v", input_v)
+
+    print("dgc...")
+    dgc(
+        grad=to_compress,
+        u=input_u,
+        v=input_v,
+        s_percent=0.151,
+        sample_rate=1.0,
+        momentum=0.1,
+        out=compressed
+    )
+    # compressed.wait_to_read()
+
+    print("M:", compressed[:4])
+    print("size:", get_size_in_header(compressed[:4]))
+    print('dgcr...')
+    dgcr(
+        data=compressed,
+        out=decompressed
+    )
+    # decompressed.wait_to_read()
+    print("validating decompressed...")
+    b = decompressed.asnumpy()
+    print("grad", to_compress)
+    print("u", input_u)
+    print("v", input_v)
+    # print("b", decompressed)
+    print("b", b)
+    print("dgc validating pass!")
+
+def verify_server_encode(N=2**6, xpu='gpu'):
+    assert(xpu in ['cpu','gpu','omp'])
+    if xpu == 'gpu':
+        ctx = mx.context.gpu(0)
+    else:
+        ctx = mx.context.cpu(0)
+
+    dgc_server = mx.nd.contrib.dgc_new_server
+    dgcr = mx.nd.contrib.dgc_new_r
+
+    a = np.random.randint(0, 100, N)
+    a[a > 10] = 0
+    to_compress = mx.nd.array(a, ctx=ctx, dtype='float32')
+    compressed = mx.nd.zeros(shape=4 * (N * 2 + 1), ctx=ctx, dtype='uint8')
+    decompressed = mx.nd.zeros(shape=N, ctx=ctx, dtype='float32')
+
+    print("dgc_server...")
+    dgc_server(
+        data=to_compress,
+        out=compressed
+    )
+    compressed.wait_to_read()
+
+    print("dgcr...")
+    dgcr(
+        data=compressed,
+        out=decompressed
+    )
+    decompressed.wait_to_read()
+
+    print('validating decompressed...')
+    b = decompressed.asnumpy()
+    for i in range(N):
+        if to_compress[i] != b[i]:
+            print("i={}\ta[i]={}\tb[i]={}".format(i,to_compress[i],b[i]))
+            assert(0)
+    print("dgc_server validating pass!")
+
 def verify_xpu(N,s_percent,sample_rate,xpu):
     assert(xpu in ['cpu','gpu','omp'])
     if xpu == 'gpu':
@@ -186,6 +320,10 @@ def verify_all():
         verify_xpu(2**i, 0.001, 0.001, 'gpu')
         # verify_xpu(2**i, 0.001, 0.001, 'cpu')
 if __name__ == '__main__':
+    # verify_mem_comp()
+    # verify_topk()
+    verify_dgc_with_residual_clear()
+    # verify_server_encode()
     # verify_all()
-    benchmark_all()
+    # benchmark_all()
 

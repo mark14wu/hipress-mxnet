@@ -15,7 +15,7 @@
 #include <thrust/functional.h>  //greater<float>
 #include <thrust/copy.h>  //copy_if
 #include <thrust/iterator/counting_iterator.h>  // counting_iterator
-#include <thrust/transform.h> //trnasform
+#include <thrust/transform.h> //transform
 
 #include "get_policy-inl.h"
 #include "ZQ_CPP_LIB/naive_random.hpp"
@@ -33,13 +33,17 @@ namespace op {
 struct dgc_new_param : public dmlc::Parameter<dgc_new_param> {
   double s_percent;
   double sample_rate;
+  double momentum;
   DMLC_DECLARE_PARAMETER(dgc_new_param){
     DMLC_DECLARE_FIELD(s_percent)
-      .set_default(0.01)
+      .set_default(0.001)
       .describe("Range of values:(0.001,0.1], determines how many values should be sent out");
     DMLC_DECLARE_FIELD(sample_rate)
       .set_default(0.001)
       .describe("input.size * sample_rate = sample_cnt");
+    DMLC_DECLARE_FIELD(momentum)
+      .set_default(0.9)
+      .describe("momentum decay rate");
   };
 };
 
@@ -58,6 +62,18 @@ inline bool dgc_new_shape(const nnvm::NodeAttrs& attrs,
 }
 
 inline bool dgc_new_type(const nnvm::NodeAttrs& attrs,
+                            std::vector<int>* in_attrs,
+                            std::vector<int>* out_attrs) {
+  CHECK_EQ(in_attrs->size(), 3U) << "Input: data, u";
+  CHECK_EQ(out_attrs->size(), 1U) << "Please provide output space";
+  CHECK_EQ(in_attrs->at(0), 0) << "Grad type should be float32";
+  CHECK_EQ(in_attrs->at(1), 0) << "U type should be float32";
+  CHECK_EQ(in_attrs->at(2), 0) << "V type should be float32";
+  CHECK_EQ(out_attrs->at(0), 3) <<"output type should be uint8_t";
+  return true;
+}
+
+inline bool dgc_new_server_type(const nnvm::NodeAttrs& attrs,
                             std::vector<int>* in_attrs,
                             std::vector<int>* out_attrs) {
   CHECK_EQ(in_attrs->size(), 1U) << "Input: data";
@@ -127,6 +143,31 @@ struct cmp_float_data_by_int32_index{
   }
 };
 
+struct generate_S_value_and_clear{
+  int32_t *S_index;
+  float* S_value;
+  float* G;
+  float* U;
+  generate_S_value_and_clear(
+    int32_t* S_index_,
+    float* S_value_,
+    float* G_,
+    float* U_
+  ):
+  S_index(S_index_),
+  S_value(S_value_),
+  G(G_),
+  U(U_)
+  {}
+  __host__ __device__
+  void operator()(const int32_t& x){
+    int32_t i = S_index[x];
+    S_value[x] = G[i];
+    G[i] = 0;
+    U[i] = 0;
+  }
+};
+
 struct generate_S_value{
   int32_t *S_index;
   float* S_value;
@@ -144,7 +185,30 @@ struct generate_S_value{
   void operator()(const int32_t& x){
     int32_t i = S_index[x];
     S_value[x] = G[i];
-    G[i] = 0;
+  }
+};
+
+struct memory_compensate {
+  float momentum;
+  float* g;
+  float* u;
+  float* v;
+  memory_compensate(
+    float _momentum,
+    float* _g,
+    float* _u,
+    float* _v
+  ):
+  momentum(_momentum),
+  g(_g),
+  u(_u),
+  v(_v)
+  {}
+  __host__ __device__
+  void operator()(const int32_t& x) {
+    u[x] = momentum * u[x] + g[x];
+    v[x] += u[x];
+    g[x] = 0;
   }
 };
 
@@ -160,24 +224,42 @@ void dgc_new_func(const nnvm::NodeAttrs& attrs,
   policy_t policy = get_policy<policy_t>::get(ctx);
   const dgc_new_param& param = nnvm::get<dgc_new_param>(attrs.parsed);
   const TBlob& in_data = inputs[0];
+  const TBlob& in_u = inputs[1];
+  const TBlob& in_v = inputs[2];
   const TBlob& out_data = outputs[0];
   auto in_float = to_array(in_data, float, float);
+  auto in_float_u = to_array(in_u, float, float);
+  auto in_float_v = to_array(in_v, float, float);
   auto out_uint8_t = to_array(out_data, uint8_t, uint8_t);
+  float momentum = static_cast<float>(param.momentum);
   int32_t sample_cnt = static_cast<int32_t>(std::ceil(in_data.Size()*param.sample_rate));
   int32_t expected_selected = static_cast<int32_t>(std::ceil(in_data.Size()*param.s_percent));
   int32_t* header = reinterpret_cast<int32_t*>(out_uint8_t);
   float* sample_G = reinterpret_cast<float*>(out_uint8_t);
   float* G = in_float;
+  float* U = in_float_u;
+  float* V = in_float_v;
   int32_t N = in_data.Size();
-  // printf("N=%d\n",N);
   // zt.record("initialize");
+  thrust::for_each(
+    policy,
+    thrust::counting_iterator<int32_t>(0),
+    thrust::counting_iterator<int32_t>(N),
+    memory_compensate(
+      momentum,
+      G,
+      U,
+      V
+    )
+  );
+  // zt.record("memory_compensate");
   thrust::for_each(
     policy,
     thrust::counting_iterator<int32_t>(0),
     thrust::counting_iterator<int32_t>(sample_cnt),
     generate_sample_G(
       sample_G,
-      G,
+      V,
       N,
       std::chrono::high_resolution_clock::now()
         .time_since_epoch()
@@ -210,7 +292,7 @@ void dgc_new_func(const nnvm::NodeAttrs& attrs,
     policy,
     thrust::counting_iterator<int32_t>(0),
     thrust::counting_iterator<int32_t>(N),
-    G,
+    V,
     S_index,
     greater(threshold)
   );
@@ -231,6 +313,71 @@ void dgc_new_func(const nnvm::NodeAttrs& attrs,
   // printf("selected_num=%d\n",selected_num);
   // zt.record("sort S_index");
   
+  int32_t out_size = 4 + selected_num*2*4;
+  get_policy<policy_t>::memcpyIn(
+    header,
+    &out_size,
+    sizeof(int32_t),
+    ctx
+  );
+  if (unlikely(selected_num == 0)){
+    return ;
+  }
+  // zt.record("memcpyIn header");
+
+  float* S_value = reinterpret_cast<float*>(S_index_end);
+  thrust::for_each(
+    policy,
+    thrust::counting_iterator<int32_t>(0),
+    thrust::counting_iterator<int32_t>(selected_num),
+    generate_S_value_and_clear(
+      S_index,
+      S_value,
+      V,
+      U
+    )
+  );
+  // zt.record("generate_S_value");
+  // zt.print_by_us();
+}
+
+struct dgc_new_server_param : public dmlc::Parameter<dgc_new_server_param> {
+  DMLC_DECLARE_PARAMETER(dgc_new_server_param){};
+};
+
+template<typename xpu, typename policy_t>
+void dgc_new_server_func(const nnvm::NodeAttrs& attrs,
+                        const OpContext& ctx,
+                        const std::vector<TBlob>& inputs,
+                        const std::vector<OpReqType>& req,
+                        const std::vector<TBlob>& outputs) {
+
+  // zq_cpp_lib::time_cost zt;
+  // zt.start();
+  policy_t policy = get_policy<policy_t>::get(ctx);
+  const TBlob& in_data = inputs[0];
+  const TBlob& out_data = outputs[0];
+  auto in_float = to_array(in_data, float, float);
+  auto out_uint8_t = to_array(out_data, uint8_t, uint8_t);
+  int32_t* header = reinterpret_cast<int32_t*>(out_uint8_t);
+  float* G = in_float;
+  int32_t N = in_data.Size();
+  // zt.record("initialize");
+
+  float threshold = 0;
+  get_policy<policy_t>::streamSynchronize(ctx);
+  int32_t* S_index = reinterpret_cast<int32_t*>(out_uint8_t+4);
+  int32_t* S_index_end = thrust::copy_if(
+    policy,
+    thrust::counting_iterator<int32_t>(0),
+    thrust::counting_iterator<int32_t>(N),
+    G,
+    S_index,
+    greater(threshold)
+  );
+  // zt.record("copy_if S_index");
+
+  int32_t selected_num = S_index_end - S_index;
   int32_t out_size = 4 + selected_num*2*4;
   get_policy<policy_t>::memcpyIn(
     header,
