@@ -1,5 +1,5 @@
-#ifndef MXNET_OPERATOR_CONTRIB_power_sgd_INL_H
-#define MXNET_OPERATOR_CONTRIB_power_sgd_INL_H
+#ifndef MXNET_OPERATOR_CONTRIB_POWER_SGD_INL_H
+#define MXNET_OPERATOR_CONTRIB_POWER_SGD_INL_H
 
 #include "../operator_common.h"
 #include <thrust/iterator/counting_iterator.h>  // counting_iterator
@@ -103,7 +103,7 @@ void power_sgd_encode2(const nnvm::NodeAttrs& attrs,
   mshadow::Tensor<xpu, 2, float> M = in_matrix.get<xpu, 2, float>(s);
   mshadow::Tensor<xpu, 2, float> Q = out_q.get<xpu, 2, float>(s);
 
-  // TODO: QR Decomposition
+  // QR Decomposition
   TransposeImpl<xpu>(ctx.run_ctx, in_p, in_p_t, mxnet::TShape({1, 0}));
   int ws_size(linalg_gelqf_workspace_query(P_T, s));
   mshadow::Tensor<xpu, 1, float> work = ctx.requested[0].get_space_typed<xpu, 1, float>(mshadow::Shape1(ws_size), s);
